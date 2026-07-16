@@ -46,10 +46,38 @@ Esto explica todo: intermitente (coincidir con la ventana de regeneración), sil
 
 ## El fix REAL
 
-A nivel de config CNI del nodo — que CRI-O **solo** vea `00-multus.conf`:
+A nivel de config CNI del nodo — que CRI-O **solo** vea `00-multus.conf`.
 
-1. **`--rename-conf-file`** (flag de `thin_entrypoint`, diseñado para esto): renombra la conf "master" (OVN-K) para que CRI-O no la use como default directamente.
-2. Eliminar la conf duplicada/stale (`05-ovn-kubernetes.conf`).
-3. (Opcional) regeneración atómica de `00-multus.conf` para no dejar ventana.
+### Lo VALIDADO experimentalmente (2026-07-15)
 
-Y como **defensa en profundidad a nivel plataforma**: **Kumi verifica `net1` y auto-repara** (recrea el device si falta) — validado en el PoC VXLAN (recuperó un pod que perdió `net1`).
+Quitando ambos confs OVN-K de la vista de CRI-O (renombrándolos a `.bak`), el race
+**desaparece: 0 fallos / 60 pods** (vs ~13% antes). Root cause + fix confirmados.
+
+### `--rename-conf-file` — NO viable en este despliegue
+
+Se probó el flag nativo `--rename-conf-file` de `thin_entrypoint` (renombra la conf
+master OVN-K a `.old` tras generar `00-multus.conf`). Elimina el race (**0/60**),
+PERO **crashloopea el pod multus**: al reiniciar, `thin_entrypoint` no encuentra el
+master (`failed to create multus config: cannot find valid master CNI config`)
+porque **ovnkube-node no recrea/mantiene el conf master** de forma sostenida — lo
+escribe una vez a `/etc/cni/net.d`. El CNI sigue funcionando (`00-multus.conf`
+persiste), pero un DaemonSet que flapea no es aceptable. Descartado como fix
+persistente en este cluster.
+
+### Fix persistente ROBUSTO (recomendado)
+
+Separar los directorios: que **ovnkube-node escriba su CNI conf en el subdir de
+multus** (p.ej. `/etc/cni/multus/net.d`) en lugar del dir principal de CRI-O, y
+apuntar `--multus-autoconfig-dir` a ese subdir. Así:
+- CRI-O (`/etc/cni/net.d`) ve **solo** `00-multus.conf` → no puede saltear multus.
+- multus siempre encuentra un master estable en el subdir → sin crashloop.
+- No hay renombrado ni ventana.
+
+Requiere ajustar el despliegue de OVN-K (dónde escribe ovnkube-node su conf). Es el
+setup arquitectónicamente correcto de OVN-K + Multus.
+
+### Defensa en profundidad (plataforma)
+
+**Kumi verifica `net1` y auto-repara** (recrea el device si falta) — validado en el
+PoC VXLAN (recuperó un pod que perdió `net1`). Cubre el gap mientras el fix CNI
+persistente no esté desplegado, aunque añade latencia de recreación.
