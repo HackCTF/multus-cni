@@ -51,6 +51,14 @@ const (
 	shortPollDuration    = 250 * time.Millisecond
 	informerPollDuration = 50 * time.Millisecond
 	shortPollTimeout     = 2500 * time.Millisecond
+
+	// HACKCTF (net1 attach race hardening): on CNI ADD, if the pod is fetched
+	// without a network-selection annotation, re-read it live up to this many times,
+	// waiting podNetAnnotRetryBackoff between attempts, to rule out a stale read
+	// before concluding it has no secondary networks. See GetPod and
+	// docs/HACKCTF-net1-attach-race.md.
+	podNetAnnotRetries      = 3
+	podNetAnnotRetryBackoff = 100 * time.Millisecond
 )
 
 var (
@@ -656,6 +664,21 @@ func isCriticalRequestRetriable(err error) bool {
 	return false
 }
 
+// podHasNoNetworkAnnotation reports whether the pod carries no (empty/absent)
+// k8s.v1.cni.cncf.io/networks annotation. It reuses GetPodNetwork so the check
+// stays in sync with how Multus itself resolves secondary networks: only an
+// absent/empty annotation yields NoK8sNetworkError. A present-but-malformed
+// annotation returns a different error and is treated here as "has networks" so
+// the normal ADD path surfaces it instead of retrying.
+func podHasNoNetworkAnnotation(pod *v1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	_, err := k8s.GetPodNetwork(pod)
+	_, isNoNet := err.(*k8s.NoK8sNetworkError)
+	return isNoNet
+}
+
 // GetPod retrieves Kubernetes Pod object from given namespace/name in k8sArgs (i.e. cni args)
 // GetPod also get pod UID, but it is not used to retrieve, but it is used for double check
 func GetPod(kubeClient *k8s.ClientInfo, k8sArgs *types.K8sArgs, isDel bool) (*v1.Pod, error) {
@@ -721,6 +744,33 @@ func GetPod(kubeClient *k8s.ClientInfo, k8sArgs *types.K8sArgs, isDel bool) (*v1
 				return nil, errPodNotFound
 			}
 			return nil, cmdErr(k8sArgs, "error waiting for pod: %v", err)
+		}
+	}
+
+	// HACKCTF fix (net1 secondary-network attach race): on CNI ADD, if the pod was
+	// fetched without a network-selection annotation, the read may have observed a
+	// stale object — the annotation is set at pod creation, but a (cache-backed)
+	// read can momentarily miss it under high pod-creation churn. Multus would then
+	// silently attach only the default network (GetPodNetwork -> NoK8sNetworkError
+	// -> zero delegates, no error), leaving the pod without its secondary interface.
+	// Re-read the pod with a live API query a few times to close that window before
+	// treating it as having no secondary networks. Pods that genuinely have none
+	// only incur these extra live reads on ADD and then proceed as before.
+	if !isDel && podHasNoNetworkAnnotation(pod) {
+		for attempt := 1; attempt <= podNetAnnotRetries; attempt++ {
+			time.Sleep(podNetAnnotRetryBackoff)
+			liveCtx, liveCancel := context.WithTimeout(context.TODO(), pollDuration)
+			livePod, liveErr := kubeClient.GetPodAPILiveQuery(liveCtx, podNamespace, podName)
+			liveCancel()
+			if liveErr != nil {
+				logging.Verbosef("GetPod: live re-query for [%s/%s] (empty network annotation) failed on attempt %d: %v", podNamespace, podName, attempt, liveErr)
+				break
+			}
+			if !podHasNoNetworkAnnotation(livePod) {
+				logging.Verbosef("GetPod: network-selection annotation for [%s/%s] appeared on live re-query attempt %d; initial read was stale", podNamespace, podName, attempt)
+				pod = livePod
+				break
+			}
 		}
 	}
 
